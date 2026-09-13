@@ -1,0 +1,168 @@
+# .github/workflows/pr-gate.yml — the PR gate.
+#
+# Same checks a human PR gets. The agent's PRs are not special-cased:
+#   1. For every stack the PR touches: init + plan on the PR head.
+#      Codify PRs must come back clean for the claimed resource (exit 0 —
+#      the HCL now matches reality). Revert PRs MUST exit 2 by design (the
+#      HCL is unchanged; the decision ships as a file), and the plan must
+#      still show exactly the drift fingerprint the PR body claims.
+#   2. Human review stays required via branch protection (configured once
+#      on the repo; the agent can never approve its own PRs).
+#
+# Auth is OIDC (vars.DRIFT_READONLY_ROLE) — no static AWS keys anywhere.
+# The gate runs on PR code, so scope that role's trust-policy `sub` to this
+# repo; the role itself stays read-only in shape (state read + lock write
+# for plan, cloudtrail:LookupEvents, Describe*).
+name: pr-gate
+on:
+  pull_request:
+    types: [opened, synchronize]
+    paths:
+      - 'stacks/**'
+      - '.drift-decisions/**'
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write       # OIDC -> read-only AWS role
+      pull-requests: read   # list the PR's changed files
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The PR's code: the gate plans what the PR proposes. This is
+          # `pull_request`, not `pull_request_target`, so a fork PR never
+          # sees this repo's secrets.
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+      - name: Stacks touched by this PR
+        id: stacks
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          files=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+            --paginate -q '.[].filename')
+          stacks=$(echo "$files" | grep -oE '^stacks/[^/]+' | cut -d/ -f2 | sort -u | tr '\n' ' ')
+          if [ -z "$stacks" ]; then
+            # Revert PRs change no HCL (decision record only) — fall back to
+            # the stack named in the agent's PR title: "[drift] <stack>: ..."
+            stacks=$(echo "${{ github.event.pull_request.title }}" \
+              | grep -oE '\[drift\] [^:]+' | sed 's/\[drift\] //')
+          fi
+          if [ -z "$stacks" ]; then
+            echo "::error::gate cannot determine the stack(s) this PR affects; failing closed"
+            exit 1
+          fi
+          echo "stacks=$stacks" >> "$GITHUB_OUTPUT"
+      - name: Resolve regions
+        id: regions
+        env:
+          STACKS: ${{ steps.stacks.outputs.stacks }}
+          REGIONS_JSON: ${{ vars.DRIFT_STACK_REGIONS_JSON }}
+        run: |
+          python3 - <<'EOF'
+          import json, os
+          regions = json.loads(os.environ.get("REGIONS_JSON") or "{}")
+          stacks = os.environ["STACKS"].split()
+          missing = [s for s in stacks if s not in regions]
+          if missing:
+              raise SystemExit(
+                f"no region for stack(s) {missing} in vars.DRIFT_STACK_REGIONS_JSON; failing closed")
+          # configure-aws-credentials needs one region; the plan loop below
+          # sets AWS_DEFAULT_REGION per stack from the same map.
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"primary={regions[stacks[0]]}\n")
+          EOF
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DRIFT_READONLY_ROLE }}
+          aws-region: ${{ steps.regions.outputs.primary }}
+      - name: Plan + enforce the gate per stack
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          STACKS: ${{ steps.stacks.outputs.stacks }}
+          REGIONS_JSON: ${{ vars.DRIFT_STACK_REGIONS_JSON }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, re, subprocess, sys
+          # PR metadata travels via env, never interpolated into this script:
+          # PR titles/bodies are attacker-influenced on public repos.
+          body = os.environ.get("PR_BODY") or ""
+          title = os.environ.get("PR_TITLE") or ""
+          rec = re.search(r"\*\*Recommendation:\*\* (\w+)", body)
+          fp = re.search(r"Drift fingerprint: `([0-9a-f]{16})`", body)
+          addr = re.search(r"\[drift\] \S+: (\S+) drifted out-of-band", title)
+          if not (rec and fp and addr):
+              sys.exit("not an agent drift PR body; failing closed")
+          recommendation, claimed_fp, target = rec.group(1), fp.group(1), addr.group(1)
+          regions = json.loads(os.environ.get("REGIONS_JSON") or "{}")
+          sys.path.insert(0, os.path.join(os.environ["GITHUB_WORKSPACE"], "agent"))
+          from remediate_full import drift_fingerprint
+
+          def sh(cmd, **kw):
+              r = subprocess.run(cmd, capture_output=True, text=True, **kw)
+              if r.returncode != 0:
+                  sys.exit(f"{' '.join(cmd)} failed:\n{r.stderr[-2000:]}")
+              return r
+
+          failures = []
+          for stack in os.environ["STACKS"].split():
+              d = os.path.join("stacks", stack)
+              env = dict(os.environ, AWS_DEFAULT_REGION=regions[stack])
+              print(f"--- stack: {stack} (region {regions[stack]}) ---")
+              sh(["terraform", "init", "-input=false"], cwd=d, env=env)
+              plan = subprocess.run(
+                  ["terraform", "plan", "-detailed-exitcode",
+                   "-out=pr.tfplan", "-input=false"],
+                  capture_output=True, text=True, cwd=d, env=env)
+              code = plan.returncode
+              if code not in (0, 2):
+                  failures.append(f"{stack}: plan errored (exit {code})")
+                  continue
+              show = subprocess.run(
+                  ["terraform", "show", "-json", "pr.tfplan"],
+                  capture_output=True, text=True, cwd=d, env=env)
+              if show.returncode != 0:
+                  failures.append(f"{stack}: terraform show failed")
+                  continue
+              plan_json = json.loads(show.stdout)
+              print(f"recommendation={recommendation} target={target} plan_exit={code}")
+              if recommendation == "Revert":
+                  # Revert PRs change no HCL, so the drift is still there: the
+                  # plan must show this resource drifted with the claimed
+                  # fingerprint. Other drift on the stack is fine.
+                  entries = (plan_json.get("resource_drift")
+                             or plan_json.get("resource_changes") or [])
+                  by_addr = {r["address"]: r["change"] for r in entries}
+                  ch = by_addr.get(target)
+                  if ch is None or ch["actions"] == ["no-op"]:
+                      failures.append(f"{stack}: revert PR: {target} shows no drift")
+                      continue
+                  actual_fp = drift_fingerprint(ch.get("before"), ch.get("after"))
+                  if actual_fp != claimed_fp:
+                      failures.append(
+                          f"{stack}: plan drift {actual_fp} != PR-claimed {claimed_fp}")
+                  else:
+                      print(f"gate: revert PR still shows the claimed drift on {target}")
+              else:
+                  # Codify PRs updated the HCL to match reality: this resource
+                  # must have no planned changes. resource_changes is the
+                  # source here — resource_drift compares against the stored
+                  # (stale) state, which still shows drift until next apply.
+                  by_addr = {r["address"]: r["change"]
+                             for r in plan_json.get("resource_changes") or []}
+                  ch = by_addr.get(target)
+                  if ch is not None and ch["actions"] != ["no-op"]:
+                      failures.append(f"{stack}: codify PR: {target} still has a diff")
+                  else:
+                      print(f"gate: codify PR cleaned {target} (other drift may remain)")
+          if failures:
+              sys.exit("GATE FAILED:\n- " + "\n- ".join(failures))
+          print("gate: all touched stacks converge per-resource")
+          EOF

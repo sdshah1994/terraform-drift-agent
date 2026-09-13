@@ -1,0 +1,52 @@
+# .github/workflows/drift-remediate.yml
+name: drift-remediate
+on:
+  workflow_dispatch:
+    inputs:
+      stack: { required: true, type: string }
+      region: { required: true, type: string }
+      run_id: { required: true, type: string }
+
+jobs:
+  remediate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # push a branch
+      pull-requests: write   # open the PR
+      id-token: write        # read-only AWS role for CloudTrail
+      actions: read          # download the drift artifact from the detect run
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sanitize stack for artifact name
+        id: sanitize
+        run: echo "safe=$(echo '${{ inputs.stack }}' | tr '/' '-')" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          name: drift-${{ steps.sanitize.outputs.safe }}
+          run-id: ${{ inputs.run_id }}
+          # required: without it, the action searches the CURRENT run
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DRIFT_READONLY_ROLE }}
+          aws-region: ${{ inputs.region }}   # same region the detect run planned in
+      - name: Analyze drift
+        # Model + AWS read access. No GitHub write token in this step.
+        run: |
+          python agent/remediate.py analyze \
+            --stack "${{ inputs.stack }}" --region "${{ inputs.region }}" \
+            --plan drift.json --out proposal/
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      - name: Open PR
+        # GitHub App (or fine-grained PAT) token — NOT GITHUB_TOKEN. PRs
+        # opened with GITHUB_TOKEN never trigger pull_request workflows, so
+        # the gate would silently skip the agent's own PRs (verified live).
+        # The repo setting "Allow GitHub Actions to create and approve pull
+        # requests" only governs GITHUB_TOKEN and doesn't change that.
+        # This step gets the bot token and nothing else.
+        run: |
+          python agent/remediate.py propose \
+            --stack "${{ inputs.stack }}" --proposal proposal/
+        env:
+          GH_TOKEN: ${{ secrets.DRIFT_BOT_TOKEN }}

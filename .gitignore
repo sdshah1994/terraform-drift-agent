@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+drift.json
+drift.tfplan
+proposal/
+.terraform.lock.hcl

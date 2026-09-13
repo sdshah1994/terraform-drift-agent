@@ -1,0 +1,99 @@
+# .github/workflows/drift-detect.yml
+name: drift-detect
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # UTC, default branch only; may be delayed under load
+  workflow_dispatch:
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      actions: write      # gh workflow run dispatches the remediation workflow
+      issues: write       # drift-storm guard opens an issue instead of dispatching
+    strategy:
+      fail-fast: false    # one stack's plan error must not cancel the others
+      matrix:
+        # One entry per stack, each with its region. CloudTrail LookupEvents
+        # is regional, so the agent has to run where the resource lives.
+        include:
+          # Add one entry per stack, each with its region. CloudTrail
+          # LookupEvents is regional, so the agent has to run where the
+          # resource lives.
+          - { stack: example, region: us-east-1 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # Role needs: state backend read + lock-table write (plan holds a
+          # state lock), cloudtrail:LookupEvents, ec2/rds/iam:Describe*.
+          # "Read-only" is the shape, not the literal policy. Requires the
+          # GitHub OIDC identity provider + trust policy in the account.
+          role-to-assume: ${{ vars.DRIFT_READONLY_ROLE }}
+          aws-region: ${{ matrix.region }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          # Pin: detect, PR-check, and apply must run the same version or
+          # provider-version churn looks like drift.
+          terraform_version: "1.9"
+      - name: Plan (refresh-only)
+        id: plan
+        working-directory: stacks/${{ matrix.stack }}
+        run: |
+          terraform init -input=false
+          set +e
+          # -lock-timeout: plan holds the state lock. Without it, colliding
+          # with an apply in progress fails this run instead of waiting.
+          terraform plan -refresh-only -detailed-exitcode \
+            -lock-timeout=5m -out=drift.tfplan -input=false
+          code=$?
+          set -e
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" -eq 1 ]; then exit 1; fi   # plan error: fail loudly
+          terraform show -json drift.tfplan > drift.json
+      - name: Sanitize stack for artifact name
+        id: sanitize
+        if: steps.plan.outputs.code == '2'
+        run: echo "safe=$(echo '${{ matrix.stack }}' | tr '/' '-')" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        if: steps.plan.outputs.code == '2'
+        with:
+          # artifact names can't contain '/'; the stack path does
+          name: drift-${{ steps.sanitize.outputs.safe }}
+          path: stacks/${{ matrix.stack }}/drift.json
+          # drift.json renders sensitive values in cleartext: keep it short-lived
+          retention-days: 7
+      - name: Count drifted resources
+        id: count
+        if: steps.plan.outputs.code == '2'
+        working-directory: stacks/${{ matrix.stack }}
+        run: |
+          # refresh-only plans report drift under resource_drift, not
+          # resource_changes (verified against a real plan on 2026-09-11)
+          n=$(python3 -c "
+          import json
+          d = json.load(open('drift.json'))
+          entries = d.get('resource_drift') or d.get('resource_changes') or []
+          print(sum(1 for r in entries if r['change']['actions'] != ['no-op']))")
+          echo "n=$n" >> "$GITHUB_OUTPUT"
+      - name: Drift-storm guard
+        # Sanity threshold: a provider upgrade looks like drift on every
+        # resource. Page a human instead of dispatching the agent.
+        if: steps.plan.outputs.code == '2' && steps.count.outputs.n > 20
+        run: |
+          gh issue create \
+            --title "[drift] storm: ${{ steps.count.outputs.n }} resources drifted in ${{ matrix.stack }}" \
+            --body "More than 20 resources drifted in one run — likely a provider/state problem, not real drift. Paging a human instead of dispatching the agent."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Dispatch remediation
+        if: steps.plan.outputs.code == '2' && steps.count.outputs.n <= 20
+        run: |
+          gh workflow run drift-remediate.yml \
+            -f stack=${{ matrix.stack }} \
+            -f region=${{ matrix.region }} \
+            -f run_id=${{ github.run_id }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
