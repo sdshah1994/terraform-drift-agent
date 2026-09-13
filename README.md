@@ -94,7 +94,7 @@ stacks/example/       layout reference — copy per stack
 ## Offline tests
 
 ```
-cd agent && python -m pytest . -q
+cd agent && python test_remediate_core.py && python test_remediate_full.py
 ```
 
 No AWS, no API keys. The suite covers the decision logic, fingerprinting,

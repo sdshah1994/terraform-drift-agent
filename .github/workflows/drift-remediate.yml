@@ -38,6 +38,7 @@ jobs:
             --plan drift.json --out proposal/
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}
       - name: Open PR
         # GitHub App (or fine-grained PAT) token — NOT GITHUB_TOKEN. PRs
         # opened with GITHUB_TOKEN never trigger pull_request workflows, so
