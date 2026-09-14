@@ -1,8 +1,6 @@
 # .github/workflows/drift-detect.yml
 name: drift-detect
 on:
-  schedule:
-    - cron: "0 */6 * * *"   # UTC, default branch only; may be delayed under load
   workflow_dispatch:
 
 jobs:
